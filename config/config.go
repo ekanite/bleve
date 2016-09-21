@@ -88,13 +88,9 @@ import (
 	_ "github.com/blevesearch/bleve/index/store/boltdb"
 	_ "github.com/blevesearch/bleve/index/store/goleveldb"
 	_ "github.com/blevesearch/bleve/index/store/gtreap"
+	_ "github.com/blevesearch/bleve/index/store/moss"
 
 	// index types
-	_ "github.com/blevesearch/bleve/index/firestorm"
+	_ "github.com/blevesearch/bleve/index/smolder"
 	_ "github.com/blevesearch/bleve/index/upside_down"
-
-	// byte array converters
-	_ "github.com/blevesearch/bleve/analysis/byte_array_converters/ignore"
-	_ "github.com/blevesearch/bleve/analysis/byte_array_converters/json"
-	_ "github.com/blevesearch/bleve/analysis/byte_array_converters/string"
 )

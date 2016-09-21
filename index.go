@@ -13,6 +13,7 @@ import (
 	"github.com/blevesearch/bleve/document"
 	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/index/store"
+	"golang.org/x/net/context"
 )
 
 // A Batch groups together multiple Index and Delete
@@ -71,7 +72,7 @@ func (b *Batch) Size() int {
 	return len(b.internal.IndexOps) + len(b.internal.InternalOps)
 }
 
-// String prints a user friendly string represenation of what
+// String prints a user friendly string representation of what
 // is inside this batch.
 func (b *Batch) String() string {
 	return b.internal.String()
@@ -167,6 +168,7 @@ type Index interface {
 	DocCount() (uint64, error)
 
 	Search(req *SearchRequest) (*SearchResult, error)
+	SearchInContext(ctx context.Context, req *SearchRequest) (*SearchResult, error)
 
 	Fields() ([]string, error)
 
@@ -174,35 +176,18 @@ type Index interface {
 	FieldDictRange(field string, startTerm []byte, endTerm []byte) (index.FieldDict, error)
 	FieldDictPrefix(field string, termPrefix []byte) (index.FieldDict, error)
 
-	// DumpAll returns a channel receiving all index rows as
-	// UpsideDownCouchRow, in lexicographic byte order. If the enumeration
-	// fails, an error is sent. The channel is closed once the enumeration
-	// completes or an error is encountered. The caller must consume all
-	// channel entries until the channel is closed to ensure the transaction
-	// and other resources associated with the enumeration are released.
-	//
-	// DumpAll exists for debugging and tooling purpose and may change in the
-	// future.
-	DumpAll() chan interface{}
-
-	// DumpDoc works like DumpAll but returns only StoredRows and
-	// TermFrequencyRows related to a document.
-	DumpDoc(id string) chan interface{}
-
-	// DumpFields works like DumpAll but returns only FieldRows.
-	DumpFields() chan interface{}
-
 	Close() error
 
 	Mapping() *IndexMapping
 
 	Stats() *IndexStat
+	StatsMap() map[string]interface{}
 
 	GetInternal(key []byte) ([]byte, error)
 	SetInternal(key, val []byte) error
 	DeleteInternal(key []byte) error
 
-	// Name returns the name of the index (by deault this is the path)
+	// Name returns the name of the index (by default this is the path)
 	Name() string
 	// SetName lets you assign your own logical name to this index
 	SetName(string)
@@ -230,7 +215,7 @@ func New(path string, mapping *IndexMapping) (Index, error) {
 // The provided mapping will be used for all
 // Index/Search operations.
 // The specified index type will be used
-// The specified kvstore implemenation will be used
+// The specified kvstore implementation will be used
 // and the provided kvconfig will be passed to its
 // constructor.
 func NewUsing(path string, mapping *IndexMapping, indexType string, kvstore string, kvconfig map[string]interface{}) (Index, error) {

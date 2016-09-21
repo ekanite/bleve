@@ -3,6 +3,7 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/rcrowley/go-metrics"
 )
@@ -11,6 +12,54 @@ import (
 // would be an import cycle.
 
 var timerPercentiles = []float64{0.5, 0.75, 0.95, 0.99, 0.999}
+
+func TimerMap(timer metrics.Timer) map[string]interface{} {
+
+	rv := make(map[string]interface{})
+	t := timer.Snapshot()
+	p := t.Percentiles(timerPercentiles)
+
+	percentileKeys := []string{"median", "75%", "95%", "99%", "99.9%"}
+	percentiles := make(map[string]interface{})
+	for i, pi := range p {
+		if !isNanOrInf(pi) {
+			percentileKey := percentileKeys[i]
+			percentiles[percentileKey] = pi
+		}
+	}
+
+	rateKeys := []string{"1-min", "5-min", "15-min", "mean"}
+	rates := make(map[string]interface{})
+	for i, ri := range []float64{t.Rate1(), t.Rate5(), t.Rate15(), t.RateMean()} {
+		if !isNanOrInf(ri) {
+			rateKey := rateKeys[i]
+			rates[rateKey] = ri
+		}
+	}
+
+	rv["count"] = t.Count()
+	rv["min"] = t.Min()
+	rv["max"] = t.Max()
+	mean := t.Mean()
+	if !isNanOrInf(mean) {
+		rv["mean"] = mean
+	}
+	stddev := t.StdDev()
+	if !isNanOrInf(stddev) {
+		rv["stddev"] = stddev
+	}
+	rv["percentiles"] = percentiles
+	rv["rates"] = rates
+
+	return rv
+}
+
+func isNanOrInf(v float64) bool {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return true
+	}
+	return false
+}
 
 func WriteTimerJSON(w io.Writer, timer metrics.Timer) {
 	t := timer.Snapshot()

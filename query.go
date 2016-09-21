@@ -192,6 +192,9 @@ func ParseQuery(input []byte) (Query, error) {
 		if err != nil {
 			return nil, err
 		}
+		if rv.Boost() == 0 {
+			rv.SetBoost(1)
+		}
 		return &rv, nil
 	}
 	_, hasWildcard := tmp["wildcard"]
@@ -200,6 +203,9 @@ func ParseQuery(input []byte) (Query, error) {
 		err := json.Unmarshal(input, &rv)
 		if err != nil {
 			return nil, err
+		}
+		if rv.Boost() == 0 {
+			rv.SetBoost(1)
 		}
 		return &rv, nil
 	}
@@ -265,7 +271,7 @@ func expandQuery(m *IndexMapping, query Query) (Query, error) {
 		switch query.(type) {
 		case *queryStringQuery:
 			q := query.(*queryStringQuery)
-			parsed, err := parseQuerySyntax(q.Query, m)
+			parsed, err := parseQuerySyntax(q.Query)
 			if err != nil {
 				return nil, fmt.Errorf("could not parse '%s': %s", q.Query, err)
 			}

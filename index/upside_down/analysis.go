@@ -65,15 +65,17 @@ func (udc *UpsideDownCouch) Analyze(d *document.Document) *index.AnalysisResult 
 		analyzeField(field, true)
 	}
 
-	for fieldIndex, tokenFreqs := range fieldTermFreqs {
-		// see if any of the composite fields need this
-		for _, compositeField := range d.CompositeFields {
-			compositeField.Compose(fieldNames[fieldIndex], fieldLengths[fieldIndex], tokenFreqs)
+	if len(d.CompositeFields) > 0 {
+		for fieldIndex, tokenFreqs := range fieldTermFreqs {
+			// see if any of the composite fields need this
+			for _, compositeField := range d.CompositeFields {
+				compositeField.Compose(fieldNames[fieldIndex], fieldLengths[fieldIndex], tokenFreqs)
+			}
 		}
-	}
 
-	for _, compositeField := range d.CompositeFields {
-		analyzeField(compositeField, false)
+		for _, compositeField := range d.CompositeFields {
+			analyzeField(compositeField, false)
+		}
 	}
 
 	rowsCapNeeded := len(rv.Rows) + 1
@@ -85,7 +87,7 @@ func (udc *UpsideDownCouch) Analyze(d *document.Document) *index.AnalysisResult 
 
 	backIndexTermEntries := make([]*BackIndexTermEntry, 0, rowsCapNeeded)
 
-	// walk through the collated information and proccess
+	// walk through the collated information and process
 	// once for each indexed field (unique name)
 	for fieldIndex, tokenFreqs := range fieldTermFreqs {
 		fieldLength := fieldLengths[fieldIndex]

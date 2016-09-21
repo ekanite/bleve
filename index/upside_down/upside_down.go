@@ -10,6 +10,7 @@
 package upside_down
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -37,8 +38,6 @@ const RowBufferSize = 4 * 1024
 
 var VersionKey = []byte{'v'}
 
-var UnsafeBatchUseDetected = fmt.Errorf("bleve.Batch is NOT thread-safe, modification after execution detected")
-
 const Version uint8 = 5
 
 var IncompatibleVersion = fmt.Errorf("incompatible version, %d is supported", Version)
@@ -60,25 +59,31 @@ type UpsideDownCouch struct {
 	writeMutex sync.Mutex
 }
 
+type docBackIndexRow struct {
+	docID        string
+	doc          *document.Document // If deletion, doc will be nil.
+	backIndexRow *BackIndexRow
+}
+
 func NewUpsideDownCouch(storeName string, storeConfig map[string]interface{}, analysisQueue *index.AnalysisQueue) (index.Index, error) {
-	return &UpsideDownCouch{
+	rv := &UpsideDownCouch{
 		version:       Version,
 		fieldCache:    index.NewFieldCache(),
 		storeName:     storeName,
 		storeConfig:   storeConfig,
 		analysisQueue: analysisQueue,
-		stats:         &indexStat{},
-	}, nil
+	}
+	rv.stats = &indexStat{i: rv}
+	return rv, nil
 }
 
 func (udc *UpsideDownCouch) init(kvwriter store.KVWriter) (err error) {
-	// prepare a list of rows
-	rows := make([]UpsideDownCouchRow, 0)
-
 	// version marker
-	rows = append(rows, NewVersionRow(udc.version))
+	rowsAll := [][]UpsideDownCouchRow{
+		{NewVersionRow(udc.version)},
+	}
 
-	err = udc.batchRows(kvwriter, nil, rows, nil)
+	err = udc.batchRows(kvwriter, nil, rowsAll, nil)
 	return
 }
 
@@ -135,91 +140,149 @@ func PutRowBuffer(buf []byte) {
 	rowBufferPool.Put(buf)
 }
 
-func (udc *UpsideDownCouch) batchRows(writer store.KVWriter, addRows []UpsideDownCouchRow, updateRows []UpsideDownCouchRow, deleteRows []UpsideDownCouchRow) (err error) {
+func (udc *UpsideDownCouch) batchRows(writer store.KVWriter, addRowsAll [][]UpsideDownCouchRow, updateRowsAll [][]UpsideDownCouchRow, deleteRowsAll [][]UpsideDownCouchRow) (err error) {
+	dictionaryDeltas := make(map[string]int64)
 
-	// prepare batch
-	wb := writer.NewBatch()
-	defer func() {
-		_ = wb.Close()
-	}()
+	// count up bytes needed for buffering.
+	addNum := 0
+	addKeyBytes := 0
+	addValBytes := 0
 
-	// buffer to work with
+	updateNum := 0
+	updateKeyBytes := 0
+	updateValBytes := 0
+
+	deleteNum := 0
+	deleteKeyBytes := 0
+
 	rowBuf := GetRowBuffer()
 
-	// add
-	for _, row := range addRows {
-		tfr, ok := row.(*TermFrequencyRow)
-		if ok {
-			if tfr.DictionaryRowKeySize() > len(rowBuf) {
-				rowBuf = make([]byte, tfr.DictionaryRowKeySize())
+	for _, addRows := range addRowsAll {
+		for _, row := range addRows {
+			tfr, ok := row.(*TermFrequencyRow)
+			if ok {
+				if tfr.DictionaryRowKeySize() > len(rowBuf) {
+					rowBuf = make([]byte, tfr.DictionaryRowKeySize())
+				}
+				dictKeySize, err := tfr.DictionaryRowKeyTo(rowBuf)
+				if err != nil {
+					return err
+				}
+				dictionaryDeltas[string(rowBuf[:dictKeySize])] += 1
 			}
-			dictKeySize, err := tfr.DictionaryRowKeyTo(rowBuf)
-			if err != nil {
-				return err
-			}
-			wb.Merge(rowBuf[:dictKeySize], dictionaryTermIncr)
+			addKeyBytes += row.KeySize()
+			addValBytes += row.ValueSize()
 		}
-		if row.KeySize()+row.ValueSize() > len(rowBuf) {
-			rowBuf = make([]byte, row.KeySize()+row.ValueSize())
-		}
-		keySize, err := row.KeyTo(rowBuf)
-		if err != nil {
-			return err
-		}
-		valSize, err := row.ValueTo(rowBuf[keySize:])
-		wb.Set(rowBuf[:keySize], rowBuf[keySize:keySize+valSize])
+		addNum += len(addRows)
 	}
 
-	// update
-	for _, row := range updateRows {
-		if row.KeySize()+row.ValueSize() > len(rowBuf) {
-			rowBuf = make([]byte, row.KeySize()+row.ValueSize())
+	for _, updateRows := range updateRowsAll {
+		for _, row := range updateRows {
+			updateKeyBytes += row.KeySize()
+			updateValBytes += row.ValueSize()
 		}
-		keySize, err := row.KeyTo(rowBuf)
-		if err != nil {
-			return err
-		}
-		valSize, err := row.ValueTo(rowBuf[keySize:])
-		if err != nil {
-			return err
-		}
-		wb.Set(rowBuf[:keySize], rowBuf[keySize:keySize+valSize])
+		updateNum += len(updateRows)
 	}
 
-	// delete
-	for _, row := range deleteRows {
-		tfr, ok := row.(*TermFrequencyRow)
-		if ok {
-			// need to decrement counter
-			if tfr.DictionaryRowKeySize() > len(rowBuf) {
-				rowBuf = make([]byte, tfr.DictionaryRowKeySize())
+	for _, deleteRows := range deleteRowsAll {
+		for _, row := range deleteRows {
+			tfr, ok := row.(*TermFrequencyRow)
+			if ok {
+				// need to decrement counter
+				if tfr.DictionaryRowKeySize() > len(rowBuf) {
+					rowBuf = make([]byte, tfr.DictionaryRowKeySize())
+				}
+				dictKeySize, err := tfr.DictionaryRowKeyTo(rowBuf)
+				if err != nil {
+					return err
+				}
+				dictionaryDeltas[string(rowBuf[:dictKeySize])] -= 1
 			}
-			dictKeySize, err := tfr.DictionaryRowKeyTo(rowBuf)
-			if err != nil {
-				return err
-			}
-			wb.Merge(rowBuf[:dictKeySize], dictionaryTermDecr)
+			deleteKeyBytes += row.KeySize()
 		}
-		if row.KeySize()+row.ValueSize() > len(rowBuf) {
-			rowBuf = make([]byte, row.KeySize()+row.ValueSize())
-		}
-		keySize, err := row.KeyTo(rowBuf)
-		if err != nil {
-			return err
-		}
-		wb.Delete(rowBuf[:keySize])
+		deleteNum += len(deleteRows)
 	}
 
 	PutRowBuffer(rowBuf)
 
+	mergeNum := len(dictionaryDeltas)
+	mergeKeyBytes := 0
+	mergeValBytes := mergeNum * DictionaryRowMaxValueSize
+
+	for dictRowKey := range dictionaryDeltas {
+		mergeKeyBytes += len(dictRowKey)
+	}
+
+	// prepare batch
+	totBytes := addKeyBytes + addValBytes +
+		updateKeyBytes + updateValBytes +
+		deleteKeyBytes +
+		2*(mergeKeyBytes+mergeValBytes)
+
+	buf, wb, err := writer.NewBatchEx(store.KVBatchOptions{
+		TotalBytes: totBytes,
+		NumSets:    addNum + updateNum,
+		NumDeletes: deleteNum,
+		NumMerges:  mergeNum,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = wb.Close()
+	}()
+
+	// fill the batch
+	for _, addRows := range addRowsAll {
+		for _, row := range addRows {
+			keySize, err := row.KeyTo(buf)
+			if err != nil {
+				return err
+			}
+			valSize, err := row.ValueTo(buf[keySize:])
+			if err != nil {
+				return err
+			}
+			wb.Set(buf[:keySize], buf[keySize:keySize+valSize])
+			buf = buf[keySize+valSize:]
+		}
+	}
+
+	for _, updateRows := range updateRowsAll {
+		for _, row := range updateRows {
+			keySize, err := row.KeyTo(buf)
+			if err != nil {
+				return err
+			}
+			valSize, err := row.ValueTo(buf[keySize:])
+			if err != nil {
+				return err
+			}
+			wb.Set(buf[:keySize], buf[keySize:keySize+valSize])
+			buf = buf[keySize+valSize:]
+		}
+	}
+
+	for _, deleteRows := range deleteRowsAll {
+		for _, row := range deleteRows {
+			keySize, err := row.KeyTo(buf)
+			if err != nil {
+				return err
+			}
+			wb.Delete(buf[:keySize])
+			buf = buf[keySize:]
+		}
+	}
+
+	for dictRowKey, delta := range dictionaryDeltas {
+		dictRowKeyLen := copy(buf, dictRowKey)
+		binary.LittleEndian.PutUint64(buf[dictRowKeyLen:], uint64(delta))
+		wb.Merge(buf[:dictRowKeyLen], buf[dictRowKeyLen:dictRowKeyLen+DictionaryRowMaxValueSize])
+		buf = buf[dictRowKeyLen+DictionaryRowMaxValueSize:]
+	}
+
 	// write out the batch
 	return writer.ExecuteBatch(wb)
-}
-
-func (udc *UpsideDownCouch) DocCount() (uint64, error) {
-	udc.m.RLock()
-	defer udc.m.RUnlock()
-	return udc.docCount, nil
 }
 
 func (udc *UpsideDownCouch) Open() (err error) {
@@ -345,6 +408,7 @@ func (udc *UpsideDownCouch) Close() error {
 func (udc *UpsideDownCouch) Update(doc *document.Document) (err error) {
 	// do analysis before acquiring write lock
 	analysisStart := time.Now()
+	numPlainTextBytes := doc.NumPlainTextBytes()
 	resultChan := make(chan *index.AnalysisResult)
 	aw := index.NewAnalysisWork(udc, doc, resultChan)
 
@@ -369,7 +433,7 @@ func (udc *UpsideDownCouch) Update(doc *document.Document) (err error) {
 	// first we lookup the backindex row for the doc id if it exists
 	// lookup the back index row
 	var backIndexRow *BackIndexRow
-	backIndexRow, err = udc.backIndexRowForDoc(kvreader, doc.ID)
+	backIndexRow, err = backIndexRowForDoc(kvreader, index.IndexInternalID(doc.ID))
 	if err != nil {
 		_ = kvreader.Close()
 		atomic.AddUint64(&udc.stats.errors, 1)
@@ -395,13 +459,22 @@ func (udc *UpsideDownCouch) Update(doc *document.Document) (err error) {
 	}()
 
 	// prepare a list of rows
-	addRows := make([]UpsideDownCouchRow, 0)
-	updateRows := make([]UpsideDownCouchRow, 0)
-	deleteRows := make([]UpsideDownCouchRow, 0)
+	var addRowsAll [][]UpsideDownCouchRow
+	var updateRowsAll [][]UpsideDownCouchRow
+	var deleteRowsAll [][]UpsideDownCouchRow
 
-	addRows, updateRows, deleteRows = udc.mergeOldAndNew(backIndexRow, result.Rows, addRows, updateRows, deleteRows)
+	addRows, updateRows, deleteRows := udc.mergeOldAndNew(backIndexRow, result.Rows)
+	if len(addRows) > 0 {
+		addRowsAll = append(addRowsAll, addRows)
+	}
+	if len(updateRows) > 0 {
+		updateRowsAll = append(updateRowsAll, updateRows)
+	}
+	if len(deleteRows) > 0 {
+		deleteRowsAll = append(deleteRowsAll, deleteRows)
+	}
 
-	err = udc.batchRows(kvwriter, addRows, updateRows, deleteRows)
+	err = udc.batchRows(kvwriter, addRowsAll, updateRowsAll, deleteRowsAll)
 	if err == nil && backIndexRow == nil {
 		udc.m.Lock()
 		udc.docCount++
@@ -410,13 +483,18 @@ func (udc *UpsideDownCouch) Update(doc *document.Document) (err error) {
 	atomic.AddUint64(&udc.stats.indexTime, uint64(time.Since(indexStart)))
 	if err == nil {
 		atomic.AddUint64(&udc.stats.updates, 1)
+		atomic.AddUint64(&udc.stats.numPlainTextBytesIndexed, numPlainTextBytes)
 	} else {
 		atomic.AddUint64(&udc.stats.errors, 1)
 	}
 	return
 }
 
-func (udc *UpsideDownCouch) mergeOldAndNew(backIndexRow *BackIndexRow, rows []index.IndexRow, addRows, updateRows, deleteRows []UpsideDownCouchRow) ([]UpsideDownCouchRow, []UpsideDownCouchRow, []UpsideDownCouchRow) {
+func (udc *UpsideDownCouch) mergeOldAndNew(backIndexRow *BackIndexRow, rows []index.IndexRow) (addRows []UpsideDownCouchRow, updateRows []UpsideDownCouchRow, deleteRows []UpsideDownCouchRow) {
+	addRows = make([]UpsideDownCouchRow, 0, len(rows))
+	updateRows = make([]UpsideDownCouchRow, 0, len(rows))
+	deleteRows = make([]UpsideDownCouchRow, 0, len(rows))
+
 	existingTermKeys := make(map[string]bool)
 	for _, key := range backIndexRow.AllTermKeys() {
 		existingTermKeys[string(key)] = true
@@ -496,6 +574,8 @@ func encodeFieldType(f document.Field) byte {
 		fieldType = 'n'
 	case *document.DateTimeField:
 		fieldType = 'd'
+	case *document.BooleanField:
+		fieldType = 'b'
 	case *document.CompositeField:
 		fieldType = 'c'
 	}
@@ -541,7 +621,7 @@ func (udc *UpsideDownCouch) Delete(id string) (err error) {
 	// first we lookup the backindex row for the doc id if it exists
 	// lookup the back index row
 	var backIndexRow *BackIndexRow
-	backIndexRow, err = udc.backIndexRowForDoc(kvreader, id)
+	backIndexRow, err = backIndexRowForDoc(kvreader, index.IndexInternalID(id))
 	if err != nil {
 		_ = kvreader.Close()
 		atomic.AddUint64(&udc.stats.errors, 1)
@@ -570,10 +650,14 @@ func (udc *UpsideDownCouch) Delete(id string) (err error) {
 		}
 	}()
 
-	deleteRows := make([]UpsideDownCouchRow, 0)
-	deleteRows = udc.deleteSingle(id, backIndexRow, deleteRows)
+	var deleteRowsAll [][]UpsideDownCouchRow
 
-	err = udc.batchRows(kvwriter, nil, nil, deleteRows)
+	deleteRows := udc.deleteSingle(id, backIndexRow, nil)
+	if len(deleteRows) > 0 {
+		deleteRowsAll = append(deleteRowsAll, deleteRows)
+	}
+
+	err = udc.batchRows(kvwriter, nil, nil, deleteRowsAll)
 	if err == nil {
 		udc.m.Lock()
 		udc.docCount--
@@ -605,50 +689,6 @@ func (udc *UpsideDownCouch) deleteSingle(id string, backIndexRow *BackIndexRow, 
 	return deleteRows
 }
 
-func (udc *UpsideDownCouch) backIndexRowForDoc(kvreader store.KVReader, docID string) (*BackIndexRow, error) {
-	// use a temporary row structure to build key
-	tempRow := &BackIndexRow{
-		doc: []byte(docID),
-	}
-
-	keyBuf := GetRowBuffer()
-	if tempRow.KeySize() > len(keyBuf) {
-		keyBuf = make([]byte, 2*tempRow.KeySize())
-	}
-	defer PutRowBuffer(keyBuf)
-	keySize, err := tempRow.KeyTo(keyBuf)
-	if err != nil {
-		return nil, err
-	}
-
-	value, err := kvreader.Get(keyBuf[:keySize])
-	if err != nil {
-		return nil, err
-	}
-	if value == nil {
-		return nil, nil
-	}
-	backIndexRow, err := NewBackIndexRowKV(keyBuf[:keySize], value)
-	if err != nil {
-		return nil, err
-	}
-	return backIndexRow, nil
-}
-
-func (udc *UpsideDownCouch) backIndexRowsForBatch(kvreader store.KVReader, batch *index.Batch) (map[string]*BackIndexRow, error) {
-	// FIXME faster to order the ids and scan sequentially
-	// for now just get it working
-	rv := make(map[string]*BackIndexRow, 0)
-	for docID := range batch.IndexOps {
-		backIndexRow, err := udc.backIndexRowForDoc(kvreader, docID)
-		if err != nil {
-			return nil, err
-		}
-		rv[docID] = backIndexRow
-	}
-	return rv, nil
-}
-
 func decodeFieldType(typ byte, name string, pos []uint64, value []byte) document.Field {
 	switch typ {
 	case 't':
@@ -657,6 +697,8 @@ func decodeFieldType(typ byte, name string, pos []uint64, value []byte) document
 		return document.NewNumericFieldFromBytes(name, pos, value)
 	case 'd':
 		return document.NewDateTimeFieldFromBytes(name, pos, value)
+	case 'b':
+		return document.NewBooleanFieldFromBytes(name, pos, value)
 	}
 	return nil
 }
@@ -692,6 +734,10 @@ func (udc *UpsideDownCouch) termVectorsFromTokenFreq(field uint16, tf *analysis.
 }
 
 func (udc *UpsideDownCouch) termFieldVectorsFromTermVectors(in []*TermVector) []*index.TermFieldVector {
+	if len(in) <= 0 {
+		return nil
+	}
+
 	rv := make([]*index.TermFieldVector, len(in))
 
 	for i, tv := range in {
@@ -710,29 +756,21 @@ func (udc *UpsideDownCouch) termFieldVectorsFromTermVectors(in []*TermVector) []
 
 func (udc *UpsideDownCouch) Batch(batch *index.Batch) (err error) {
 	analysisStart := time.Now()
-	resultChan := make(chan *index.AnalysisResult)
+
+	resultChan := make(chan *index.AnalysisResult, len(batch.IndexOps))
 
 	var numUpdates uint64
+	var numPlainTextBytes uint64
 	for _, doc := range batch.IndexOps {
 		if doc != nil {
 			numUpdates++
+			numPlainTextBytes += doc.NumPlainTextBytes()
 		}
 	}
 
-	var detectedUnsafeMutex sync.RWMutex
-	detectedUnsafe := false
-
 	go func() {
-		sofar := uint64(0)
 		for _, doc := range batch.IndexOps {
 			if doc != nil {
-				sofar++
-				if sofar > numUpdates {
-					detectedUnsafeMutex.Lock()
-					detectedUnsafe = true
-					detectedUnsafeMutex.Unlock()
-					return
-				}
 				aw := index.NewAnalysisWork(udc, doc, resultChan)
 				// put the work on the queue
 				udc.analysisQueue.Queue(aw)
@@ -740,8 +778,43 @@ func (udc *UpsideDownCouch) Batch(batch *index.Batch) (err error) {
 		}
 	}()
 
+	// retrieve back index rows concurrent with analysis
+	docBackIndexRowErr := error(nil)
+	docBackIndexRowCh := make(chan *docBackIndexRow, len(batch.IndexOps))
+
+	udc.writeMutex.Lock()
+	defer udc.writeMutex.Unlock()
+
+	go func() {
+		defer close(docBackIndexRowCh)
+
+		// open a reader for backindex lookup
+		var kvreader store.KVReader
+		kvreader, err = udc.store.Reader()
+		if err != nil {
+			docBackIndexRowErr = err
+			return
+		}
+
+		for docID, doc := range batch.IndexOps {
+			backIndexRow, err := backIndexRowForDoc(kvreader, index.IndexInternalID(docID))
+			if err != nil {
+				docBackIndexRowErr = err
+				return
+			}
+
+			docBackIndexRowCh <- &docBackIndexRow{docID, doc, backIndexRow}
+		}
+
+		err = kvreader.Close()
+		if err != nil {
+			docBackIndexRowErr = err
+			return
+		}
+	}()
+
+	// wait for analysis result
 	newRowsMap := make(map[string][]index.IndexRow)
-	// wait for the result
 	var itemsDeQueued uint64
 	for itemsDeQueued < numUpdates {
 		result := <-resultChan
@@ -750,68 +823,22 @@ func (udc *UpsideDownCouch) Batch(batch *index.Batch) (err error) {
 	}
 	close(resultChan)
 
-	detectedUnsafeMutex.RLock()
-	defer detectedUnsafeMutex.RUnlock()
-	if detectedUnsafe {
-		return UnsafeBatchUseDetected
-	}
-
 	atomic.AddUint64(&udc.stats.analysisTime, uint64(time.Since(analysisStart)))
-
-	indexStart := time.Now()
-
-	udc.writeMutex.Lock()
-	defer udc.writeMutex.Unlock()
-
-	// open a reader for backindex lookup
-	var kvreader store.KVReader
-	kvreader, err = udc.store.Reader()
-	if err != nil {
-		return
-	}
-
-	// first lookup all the back index rows
-	var backIndexRows map[string]*BackIndexRow
-	backIndexRows, err = udc.backIndexRowsForBatch(kvreader, batch)
-	if err != nil {
-		_ = kvreader.Close()
-		return
-	}
-
-	err = kvreader.Close()
-	if err != nil {
-		return
-	}
-
-	// start a writer for this batch
-	var kvwriter store.KVWriter
-	kvwriter, err = udc.store.Writer()
-	if err != nil {
-		return
-	}
-
-	// prepare a list of rows
-	addRows := make([]UpsideDownCouchRow, 0)
-	updateRows := make([]UpsideDownCouchRow, 0)
-	deleteRows := make([]UpsideDownCouchRow, 0)
 
 	docsAdded := uint64(0)
 	docsDeleted := uint64(0)
-	for docID, doc := range batch.IndexOps {
-		backIndexRow := backIndexRows[docID]
-		if doc == nil && backIndexRow != nil {
-			// delete
-			deleteRows = udc.deleteSingle(docID, backIndexRow, deleteRows)
-			docsDeleted++
-		} else if doc != nil {
-			addRows, updateRows, deleteRows = udc.mergeOldAndNew(backIndexRow, newRowsMap[docID], addRows, updateRows, deleteRows)
-			if backIndexRow == nil {
-				docsAdded++
-			}
-		}
-	}
+
+	indexStart := time.Now()
+
+	// prepare a list of rows
+	var addRowsAll [][]UpsideDownCouchRow
+	var updateRowsAll [][]UpsideDownCouchRow
+	var deleteRowsAll [][]UpsideDownCouchRow
 
 	// add the internal ops
+	var updateRows []UpsideDownCouchRow
+	var deleteRows []UpsideDownCouchRow
+
 	for internalKey, internalValue := range batch.InternalOps {
 		if internalValue == nil {
 			// delete
@@ -823,7 +850,51 @@ func (udc *UpsideDownCouch) Batch(batch *index.Batch) (err error) {
 		}
 	}
 
-	err = udc.batchRows(kvwriter, addRows, updateRows, deleteRows)
+	if len(updateRows) > 0 {
+		updateRowsAll = append(updateRowsAll, updateRows)
+	}
+	if len(deleteRows) > 0 {
+		deleteRowsAll = append(deleteRowsAll, deleteRows)
+	}
+
+	// process back index rows as they arrive
+	for dbir := range docBackIndexRowCh {
+		if dbir.doc == nil && dbir.backIndexRow != nil {
+			// delete
+			deleteRows := udc.deleteSingle(dbir.docID, dbir.backIndexRow, nil)
+			if len(deleteRows) > 0 {
+				deleteRowsAll = append(deleteRowsAll, deleteRows)
+			}
+			docsDeleted++
+		} else if dbir.doc != nil {
+			addRows, updateRows, deleteRows := udc.mergeOldAndNew(dbir.backIndexRow, newRowsMap[dbir.docID])
+			if len(addRows) > 0 {
+				addRowsAll = append(addRowsAll, addRows)
+			}
+			if len(updateRows) > 0 {
+				updateRowsAll = append(updateRowsAll, updateRows)
+			}
+			if len(deleteRows) > 0 {
+				deleteRowsAll = append(deleteRowsAll, deleteRows)
+			}
+			if dbir.backIndexRow == nil {
+				docsAdded++
+			}
+		}
+	}
+
+	if docBackIndexRowErr != nil {
+		return docBackIndexRowErr
+	}
+
+	// start a writer for this batch
+	var kvwriter store.KVWriter
+	kvwriter, err = udc.store.Writer()
+	if err != nil {
+		return
+	}
+
+	err = udc.batchRows(kvwriter, addRowsAll, updateRowsAll, deleteRowsAll)
 	if err != nil {
 		_ = kvwriter.Close()
 		atomic.AddUint64(&udc.stats.errors, 1)
@@ -831,6 +902,7 @@ func (udc *UpsideDownCouch) Batch(batch *index.Batch) (err error) {
 	}
 
 	err = kvwriter.Close()
+
 	atomic.AddUint64(&udc.stats.indexTime, uint64(time.Since(indexStart)))
 
 	if err == nil {
@@ -841,6 +913,7 @@ func (udc *UpsideDownCouch) Batch(batch *index.Batch) (err error) {
 		atomic.AddUint64(&udc.stats.updates, numUpdates)
 		atomic.AddUint64(&udc.stats.deletes, docsDeleted)
 		atomic.AddUint64(&udc.stats.batches, 1)
+		atomic.AddUint64(&udc.stats.numPlainTextBytesIndexed, numPlainTextBytes)
 	} else {
 		atomic.AddUint64(&udc.stats.errors, 1)
 	}
@@ -906,14 +979,52 @@ func (udc *UpsideDownCouch) Stats() json.Marshaler {
 	return udc.stats
 }
 
+func (udc *UpsideDownCouch) StatsMap() map[string]interface{} {
+	return udc.stats.statsMap()
+}
+
+func (udc *UpsideDownCouch) Advanced() (store.KVStore, error) {
+	return udc.store, nil
+}
+
 func (udc *UpsideDownCouch) fieldIndexOrNewRow(name string) (uint16, *FieldRow) {
 	index, existed := udc.fieldCache.FieldNamed(name, true)
 	if !existed {
-		return index, NewFieldRow(uint16(index), name)
+		return index, NewFieldRow(index, name)
 	}
 	return index, nil
 }
 
 func init() {
 	registry.RegisterIndexType(Name, NewUpsideDownCouch)
+}
+
+func backIndexRowForDoc(kvreader store.KVReader, docID index.IndexInternalID) (*BackIndexRow, error) {
+	// use a temporary row structure to build key
+	tempRow := &BackIndexRow{
+		doc: docID,
+	}
+
+	keyBuf := GetRowBuffer()
+	if tempRow.KeySize() > len(keyBuf) {
+		keyBuf = make([]byte, 2*tempRow.KeySize())
+	}
+	defer PutRowBuffer(keyBuf)
+	keySize, err := tempRow.KeyTo(keyBuf)
+	if err != nil {
+		return nil, err
+	}
+
+	value, err := kvreader.Get(keyBuf[:keySize])
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	backIndexRow, err := NewBackIndexRowKV(keyBuf[:keySize], value)
+	if err != nil {
+		return nil, err
+	}
+	return backIndexRow, nil
 }

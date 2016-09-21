@@ -44,12 +44,20 @@ func TestDump(t *testing.T) {
 	}()
 
 	var expectedCount uint64
-	docCount, err := idx.DocCount()
+	reader, err := idx.Reader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	docCount, err := reader.DocCount()
 	if err != nil {
 		t.Error(err)
 	}
 	if docCount != expectedCount {
 		t.Errorf("Expected document count to be %d got %d", expectedCount, docCount)
+	}
+	err = reader.Close()
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	doc := document.NewDocument("1")
@@ -79,8 +87,12 @@ func TestDump(t *testing.T) {
 	}
 
 	fieldsCount := 0
-	fieldsRows := idx.DumpFields()
-	for _ = range fieldsRows {
+	reader, err = idx.Reader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fieldsRows := reader.DumpFields()
+	for range fieldsRows {
 		fieldsCount++
 	}
 	if fieldsCount != 3 {
@@ -93,8 +105,8 @@ func TestDump(t *testing.T) {
 	// 3 stored fields
 	expectedDocRowCount := int(1 + (2 * (64 / document.DefaultPrecisionStep)) + 3)
 	docRowCount := 0
-	docRows := idx.DumpDoc("1")
-	for _ = range docRows {
+	docRows := reader.DumpDoc("1")
+	for range docRows {
 		docRowCount++
 	}
 	if docRowCount != expectedDocRowCount {
@@ -102,8 +114,8 @@ func TestDump(t *testing.T) {
 	}
 
 	docRowCount = 0
-	docRows = idx.DumpDoc("2")
-	for _ = range docRows {
+	docRows = reader.DumpDoc("2")
+	for range docRows {
 		docRowCount++
 	}
 	if docRowCount != expectedDocRowCount {
@@ -119,11 +131,16 @@ func TestDump(t *testing.T) {
 	// 16 date term row counts (shared for both docs, same date value)
 	expectedAllRowCount := int(1 + fieldsCount + (2 * expectedDocRowCount) + 2 + 2 + int((2 * (64 / document.DefaultPrecisionStep))))
 	allRowCount := 0
-	allRows := idx.DumpAll()
-	for _ = range allRows {
+	allRows := reader.DumpAll()
+	for range allRows {
 		allRowCount++
 	}
 	if allRowCount != expectedAllRowCount {
 		t.Errorf("expected %d rows for all, got %d", expectedAllRowCount, allRowCount)
+	}
+
+	err = reader.Close()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

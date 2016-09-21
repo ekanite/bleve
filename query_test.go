@@ -35,15 +35,33 @@ func TestParseQuery(t *testing.T) {
 			output: NewMatchQuery("beer").SetField("desc"),
 		},
 		{
+			input:  []byte(`{"match":"beer","field":"desc","operator":"or"}`),
+			output: NewMatchQuery("beer").SetField("desc"),
+		},
+		{
+			input:  []byte(`{"match":"beer","field":"desc","operator":"and"}`),
+			output: NewMatchQueryOperator("beer", MatchQueryOperatorAnd).SetField("desc"),
+		},
+		{
+			input:  []byte(`{"match":"beer","field":"desc","operator":"or"}`),
+			output: NewMatchQueryOperator("beer", MatchQueryOperatorOr).SetField("desc"),
+		},
+		{
+			input:  []byte(`{"match":"beer","field":"desc","operator":"does not exist"}`),
+			output: nil,
+			err:    matchQueryOperatorUnmarshalError("does not exist"),
+		},
+		{
 			input:  []byte(`{"match_phrase":"light beer","field":"desc"}`),
 			output: NewMatchPhraseQuery("light beer").SetField("desc"),
 		},
 		{
 			input: []byte(`{"must":{"conjuncts": [{"match":"beer","field":"desc"}]},"should":{"disjuncts": [{"match":"water","field":"desc"}],"min":1.0},"must_not":{"disjuncts": [{"match":"devon","field":"desc"}]}}`),
-			output: NewBooleanQuery(
+			output: NewBooleanQueryMinShould(
 				[]Query{NewMatchQuery("beer").SetField("desc")},
 				[]Query{NewMatchQuery("water").SetField("desc")},
-				[]Query{NewMatchQuery("devon").SetField("desc")}),
+				[]Query{NewMatchQuery("devon").SetField("desc")},
+				1.0),
 		},
 		{
 			input:  []byte(`{"terms":["watered","down"],"field":"desc"}`),
@@ -96,7 +114,6 @@ func TestParseQuery(t *testing.T) {
 
 		if !reflect.DeepEqual(test.output, actual) {
 			t.Errorf("expected: %#v, got: %#v", test.output, actual)
-			// t.Errorf("expected: %#v, got: %#v", test.output.(*BooleanQuery).Should, actual.(*BooleanQuery).Should)
 		}
 	}
 }
@@ -280,7 +297,7 @@ func TestDumpQuery(t *testing.T) {
       }
     ],
     "boost": 1,
-    "min": 1
+    "min": 0
   },
   "must_not": {
     "disjuncts": [
