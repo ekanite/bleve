@@ -1,19 +1,20 @@
 //  Copyright (c) 2016 Couchbase, Inc.
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the
-//  License. You may obtain a copy of the License at
-//    http://www.apache.org/licenses/LICENSE-2.0
-//  Unless required by applicable law or agreed to in writing,
-//  software distributed under the License is distributed on an "AS
-//  IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
-//  express or implied. See the License for the specific language
-//  governing permissions and limitations under the License.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 		http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package moss
 
 import (
-	"bytes"
-
 	"github.com/couchbase/moss"
 )
 
@@ -29,29 +30,9 @@ type Iterator struct {
 }
 
 func (x *Iterator) Seek(seekToKey []byte) {
-	x.k = nil
-	x.v = nil
-	x.err = moss.ErrIteratorDone
+	_ = x.iter.SeekTo(seekToKey)
 
-	if bytes.Compare(seekToKey, x.start) < 0 {
-		seekToKey = x.start
-	}
-
-	iter, err := x.ss.StartIterator(seekToKey, x.end, moss.IteratorOptions{})
-	if err != nil {
-		x.store.Logf("bleve moss StartIterator err: %v", err)
-		return
-	}
-
-	err = x.iter.Close()
-	if err != nil {
-		x.store.Logf("bleve moss iterator.Seek err: %v", err)
-		return
-	}
-
-	x.iter = iter
-
-	x.current()
+	x.k, x.v, x.err = x.iter.Current()
 }
 
 func (x *Iterator) Next() {
